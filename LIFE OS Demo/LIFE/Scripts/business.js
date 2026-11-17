@@ -1,0 +1,884 @@
+// LIFE OS vault engine · business · don't edit unless you know JavaScript
+// ===== LIFE OS vault engine: shared helpers (auto-included in every script) =====
+const zz = (() => {
+  const APP = (typeof app !== "undefined") ? app : window.app;
+  const pad = n => String(n).padStart(2, "0");
+  const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const now = () => new Date();
+  const today = () => ymd(now());
+  const parseYmd = s => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "").trim().slice(0, 10));
+    if (!m) return null;
+    const d = new Date(+m[1], +m[2] - 1, +m[3]);
+    return (d.getMonth() === +m[2] - 1) ? d : null; // rejects 2026-02-31
+  };
+  const validYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s || "").trim()) && !!parseYmd(s);
+  const toDate = x => {
+    if (x === null || x === undefined || x === "") return null;
+    if (x.toJSDate) { const d = x.toJSDate(); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+    if (x instanceof Date) return new Date(x.getFullYear(), x.getMonth(), x.getDate());
+    return parseYmd(String(x).slice(0, 10));
+  };
+  const daysBetween = (a, b) => Math.round((toDate(b) - toDate(a)) / 864e5);
+  const daysUntil = x => { const d = toDate(x); return d ? daysBetween(today(), d) : null; };
+  const monthKey = d => ymd(d).slice(0, 7);
+  const addMonths = (mk, n) => { const [y, m] = mk.split("-").map(Number); return monthKey(new Date(y, m - 1 + n, 1)); };
+  const monthName = mk => { const [y, m] = mk.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleString("en-GB", { month: "long", year: "numeric" }); };
+  const weekStart = (d = now()) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const wd = (x.getDay() + 6) % 7; x.setDate(x.getDate() - wd); return x; };
+  const num = x => {
+    if (x === null || x === undefined) return NaN;
+    if (typeof x === "number") return x;
+    const s = String(x).replace(/[€\s]/g, "").replace(",", ".");
+    if (s === "" || !/^[-+]?\d*\.?\d+$/.test(s)) return NaN;
+    return Number(s);
+  };
+  const n0 = x => { const v = num(x); return isFinite(v) ? v : 0; };
+  const round2 = x => Math.round(x * 100) / 100;
+  // € formatting, Austrian style: €1.234,50 (no dependence on system locale)
+  const group = s => s.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  const eur = x => { const v = Math.abs(round2(x)); const [i, d] = v.toFixed(2).split("."); return (round2(x) < 0 ? "−" : "") + "€" + group(i) + "," + d; };
+  const eur0 = x => { const v = round2(x); return Number.isInteger(v) ? (v < 0 ? "−" : "") + "€" + group(String(Math.abs(v))) : eur(v); };
+  const fmt = (x, dec = 2) => { const r = Number(x.toFixed(dec)); const [i, d] = Math.abs(r).toFixed(dec).split("."); return (r < 0 ? "−" : "") + group(i) + (d ? "," + d : ""); };
+  const plain = x => String(round2(x)); // for writing into files: 12.4 → "12.4"
+
+  // ---- files ----
+  // finds the real path even if a folder was renamed with different capitals (Uni → UNI)
+  let FIXMAP = null, FIXT = 0;
+  function fix(p) {
+    if (!p || APP.vault.getAbstractFileByPath(p)) return p;
+    if (!FIXMAP || Date.now() - FIXT > 3000) { FIXMAP = new Map(); for (const f of (APP.vault.getAllLoadedFiles ? APP.vault.getAllLoadedFiles() : APP.vault.getFiles())) if (f.path) FIXMAP.set(f.path.toLowerCase(), f.path); FIXT = Date.now(); }
+    const hit = FIXMAP.get(p.toLowerCase()) || FIXMAP.get((p + ".md").toLowerCase());
+    if (hit) return p.toLowerCase() === hit.toLowerCase() ? hit : hit.replace(/\.md$/, "");
+    const parts = p.split("/");
+    for (let i = parts.length - 1; i > 0; i--) { const pre = FIXMAP.get(parts.slice(0, i).join("/").toLowerCase()); if (pre) return pre + "/" + parts.slice(i).join("/"); }
+    return p;
+  }
+  const getFile = p => APP.vault.getAbstractFileByPath(p) || APP.vault.getAbstractFileByPath(fix(p));
+  async function read(p) { const f = getFile(p); if (!f) return null; return await APP.vault.read(f); }
+  async function write(p, fn) {
+    const f = getFile(p);
+    if (!f) throw new Error("File not found: " + p);
+    if (APP.vault.process) return await APP.vault.process(f, fn);
+    const t = await APP.vault.read(f); await APP.vault.modify(f, fn(t));
+  }
+  async function ensureFolder(folder) {
+    if (!folder) return;
+    const parts = folder.split("/"); let cur = "";
+    for (const p of parts) { cur = cur ? cur + "/" + p : p; if (!getFile(cur)) { try { await APP.vault.createFolder(cur); } catch (e) { /* exists */ } } }
+  }
+  // create a note; adds " (2)", " (3)"… if the name is taken. Returns the path used.
+  async function createFile(path, content) {
+    const dot = path.lastIndexOf("."), base = path.slice(0, dot), ext = path.slice(dot);
+    let p = path, i = 2;
+    while (getFile(p)) p = `${base} (${i++})${ext}`;
+    await ensureFolder(p.split("/").slice(0, -1).join("/"));
+    await APP.vault.create(p, content);
+    return p;
+  }
+  const safeName = s => String(s || "").replace(/[\\/:*?"<>|#^[\]]/g, "").replace(/\s+/g, " ").trim().slice(0, 80) || "Untitled";
+  // clickable internal link
+  function link(text, target) {
+    const a = h("a", { class: "internal-link", "data-href": target, href: target }, text);
+    a.addEventListener("click", ev => { ev.preventDefault(); try { APP.workspace.openLinkText(target, "", false); } catch (e) { } });
+    return a;
+  }
+  async function frontmatter(p, fn) {
+    const f = getFile(p);
+    if (!f) throw new Error("File not found: " + p);
+    await APP.fileManager.processFrontMatter(f, fn);
+  }
+
+  // ---- markdown tables ----
+  function splitRow(line) {
+    let s = line.trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|")) s = s.slice(0, -1);
+    return s.split("|").map(c => c.trim());
+  }
+  const isSep = line => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
+  const isRow = line => /^\s*\|/.test(line);
+  const normH = s => String(s || "").replace(/\*/g, "").trim().toLowerCase();
+  function headMatches(head, want) {
+    const w = [].concat(want);
+    return w.every((x, i) => normH(head[i]) === normH(x));
+  }
+  function findTable(text, firstHeader, fromLine = 0) {
+    const lines = text.split("\n");
+    for (let i = fromLine; i < lines.length - 1; i++) {
+      if (isRow(lines[i]) && isSep(lines[i + 1])) {
+        const head = splitRow(lines[i]);
+        if (headMatches(head, firstHeader)) {
+          let j = i + 2; const rows = [];
+          while (j < lines.length && isRow(lines[j])) { rows.push({ line: j, cells: splitRow(lines[j]), raw: lines[j] }); j++; }
+          return { lines, head, start: i, end: j, rows };
+        }
+      }
+    }
+    return null;
+  }
+  const cell = v => String(v === null || v === undefined ? "" : v).replace(/\|/g, "/").replace(/[\r\n]+/g, " ").trim();
+  const makeRow = cells => "| " + cells.map(cell).join(" | ") + " |";
+  // append a row at the end of the table whose first header is `firstHeader`
+  async function appendRow(path, firstHeader, cells) {
+    let ok = false;
+    await write(path, text => {
+      const t = findTable(text, firstHeader);
+      if (!t) return text;
+      // drop trailing completely-empty rows so new rows go where they belong
+      let end = t.end;
+      while (end > t.start + 2 && splitRow(t.lines[end - 1]).every(c => c === "")) end--;
+      t.lines.splice(end, 0, makeRow(cells)); ok = true;
+      return t.lines.join("\n");
+    });
+    if (!ok) throw new Error(`Table "${[].concat(firstHeader).join(" | ")}" not found in ${path}`);
+  }
+  // read a table as objects keyed by (lower-case) header name
+  function tableObjects(text, firstHeader) {
+    const t = text === null || text === undefined ? null : findTable(text, firstHeader);
+    if (!t) return null;
+    const keys = t.head.map(normH);
+    const rows = t.rows.map(r => { const o = { _line: r.line, _raw: r.raw, _cells: r.cells }; keys.forEach((k, i) => { o[k] = (r.cells[i] ?? "").trim(); }); return o; });
+    return { t, keys, rows };
+  }
+  async function readTable(path, firstHeader) { const tx = await read(path); return tx === null ? null : tableObjects(tx, firstHeader); }
+  // replace a whole table (header + rows); if missing, append it under `heading`
+  function setTable(text, firstHeader, headers, rows, heading) {
+    const t = findTable(text, firstHeader);
+    const block = [makeRow(headers), "|" + headers.map(() => "---|").join(""), ...rows.map(makeRow)];
+    if (!t) return text.trimEnd() + "\n\n" + (heading ? heading + "\n" : "") + block.join("\n") + "\n";
+    t.lines.splice(t.start, t.end - t.start, ...block);
+    return t.lines.join("\n");
+  }
+  async function writeTable(path, firstHeader, headers, rows, heading) { await write(path, text => setTable(text, firstHeader, headers, rows, heading)); }
+  async function trash(path) { const f = getFile(path); if (!f) return false; if (APP.vault.trash) await APP.vault.trash(f, true); else await APP.vault.delete(f, true); return true; }
+  // delete one exact row (line number + content must match, otherwise search by content)
+  async function deleteRow(path, line, raw) {
+    let ok = false;
+    await write(path, text => {
+      const lines = text.split("\n");
+      let i = (lines[line] === raw) ? line : lines.lastIndexOf(raw);
+      if (i >= 0) { lines.splice(i, 1); ok = true; }
+      return lines.join("\n");
+    });
+    return ok;
+  }
+
+  // ---- UI ----
+  function h(tag, attrs, ...kids) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === "style") e.setAttribute("style", v);
+      else if (k === "class") e.className = v;
+      else if (k.startsWith("on") && typeof v === "function") e.addEventListener(k.slice(2), v);
+      else if (k === "value") e.value = v;
+      else if (k === "selected" || k === "checked") e[k] = !!v;
+      else e.setAttribute(k, v === true ? "" : v);
+    }
+    for (const k of kids.flat(Infinity)) {
+      if (k === null || k === undefined || k === false) continue;
+      e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+    }
+    return e;
+  }
+  const CSS = `
+.zz{font-size:var(--font-ui-medium,15px)}
+.zz-card{background:var(--background-secondary);border:1px solid var(--background-modifier-border);border-radius:10px;padding:12px 14px;margin:8px 0}
+.zz-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.zz-stat{background:var(--background-primary);border-radius:8px;padding:8px 10px}
+.zz-stat .zz-v{font-size:1.25em;font-weight:700}
+.zz-muted{color:var(--text-muted);font-size:.88em}
+.zz-ok{color:var(--color-green,#2e9e5b)} .zz-bad{color:var(--color-red,#d24343)} .zz-warn{color:var(--color-orange,#d98a1c)}
+.zz-bar{height:8px;border-radius:4px;background:var(--background-modifier-border);overflow:hidden;min-width:60px}
+.zz-bar>div{height:100%;border-radius:4px}
+.zz-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+.zz input,.zz select{font-size:.95em;padding:3px 6px;border-radius:6px;max-width:100%}
+.zz-btn{cursor:pointer;padding:4px 12px;border-radius:6px}
+.zz-btn.mod-cta{background:var(--interactive-accent);color:var(--text-on-accent)}
+.zz-x{cursor:pointer;color:var(--text-muted);border:none;background:none;padding:0 6px;box-shadow:none}
+.zz-x:hover{color:var(--color-red,#d24343)}
+.zz-table{width:100%;border-collapse:collapse;margin:6px 0}
+.zz-table td,.zz-table th{padding:4px 6px;border-bottom:1px solid var(--background-modifier-border);text-align:left;vertical-align:middle}
+.zz-table th{font-size:.85em;color:var(--text-muted);font-weight:600}
+.zz-table td.r,.zz-table th.r{text-align:right;white-space:nowrap}
+.zz h4{margin:6px 0}
+.zz-msg{font-size:.9em;margin-left:6px}
+.zz-card{box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.zz-donut{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.zz-legend>div{display:flex;align-items:center;gap:6px;margin:3px 0}
+.zz-sw{width:12px;height:12px;border-radius:3px;display:inline-block;flex:none}
+.zz-chip{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.8em;background:var(--background-modifier-hover)}
+.zz-hero{background:linear-gradient(135deg,var(--interactive-accent),color-mix(in srgb,var(--interactive-accent) 55%,#000));color:#fff;border-radius:14px;padding:18px 20px;margin:6px 0 10px}
+.zz-hero .zz-muted{color:rgba(255,255,255,.8)}
+.zz-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0}
+.zz-tile{background:var(--background-secondary);border:1px solid var(--background-modifier-border);border-radius:12px;padding:10px 12px;cursor:pointer}
+.zz-tile:hover{border-color:var(--interactive-accent)}
+.zz-tile .zz-v{font-size:1.4em;font-weight:800;margin:2px 0}
+.zz-tile .zz-bar{margin-top:6px}
+.zz-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+.zz-sec{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}
+.zz-sec a.zz-seccard{display:block;text-decoration:none;color:var(--text-normal);background:var(--background-secondary);border:1px solid var(--background-modifier-border);border-radius:12px;padding:12px}
+.zz-sec a.zz-seccard:hover{border-color:var(--interactive-accent)}
+.zz-badge{float:right;font-size:.75em;color:var(--color-orange,#d98a1c)}
+.zz-home{--file-line-width:1100px}
+.zz-home .metadata-container,.zz-home .inline-title{display:none}
+.zz-home h2{margin-top:1.2em;font-size:1.15em}
+.zz-hero .zz-btn:hover{background:rgba(255,255,255,.3)!important}
+.zz-agenda-day{margin:10px 0 2px;font-weight:700;font-size:.9em;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em}
+.zz-agenda-item{display:flex;gap:10px;padding:5px 8px;border-radius:8px}
+.zz-agenda-item:hover{background:var(--background-modifier-hover)}
+.zz-todo{display:flex;align-items:flex-start;gap:6px;padding:3px 0;font-size:.95em}
+.zz-todo label{flex:1;min-width:0;cursor:pointer}
+.zz-todo input{margin-top:3px}
+.zz-todo .zz-chip{flex:none;white-space:nowrap}
+.zz-todo .zz-mv{flex:none;display:flex;flex-direction:column;line-height:.9}
+.zz-todo .zz-mv button{padding:0 3px;font-size:.62em;opacity:.35}
+.zz-todo:hover .zz-mv button:not([disabled]){opacity:1}
+.zz-secmv{float:right;font-weight:400}
+.zz-secmv button{font-size:.8em;opacity:.45}
+.zz-secmv button:hover{opacity:1}
+.zz-todo.done label{text-decoration:line-through;opacity:.55}
+.zz-sub{font-size:.75em;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin:8px 0 2px}
+.zz-sub a{color:var(--text-muted)}
+.zz-fbtn{cursor:pointer;border:1px solid var(--background-modifier-border);background:none;border-radius:14px;padding:2px 10px;font-size:.82em;box-shadow:none}
+.zz-fbtn.on{background:var(--interactive-accent);color:var(--text-on-accent);border-color:transparent}
+`;
+  const cssStr = s => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // count open things per note: open tasks "- [ ]" + ⏳ markers (outside code blocks)
+  function openCount(text) {
+    const t = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]*`/g, "").replace(/<!--[\s\S]*?-->/g, "");
+    return (t.match(/^\s*[-*+] \[ \]/gm) || []).length + (t.match(/⏳/g) || []).length;
+  }
+  async function computeOpen(base) {
+    const out = new Map();
+    for (const f of APP.vault.getMarkdownFiles()) {
+      if (base && !f.path.startsWith(base)) continue;
+      const rel = f.path.slice(base.length);
+      if (/^(Templates|Scripts)\//.test(rel) || rel === "CLAUDE.md") continue;
+      const n = openCount(await APP.vault.cachedRead(f));
+      if (n) out.set(f.path, n);
+    }
+    return out;
+  }
+  async function sidebar(base) {
+    const W = window;
+    if (W.__zzSideT && Date.now() - W.__zzSideT < 15000) return;
+    W.__zzSideT = Date.now();
+    try {
+      const files = await computeOpen(base || "");
+      const folders = new Map();
+      for (const [p, n] of files) { const parts = p.split("/"); for (let i = 1; i < parts.length; i++) { const f = parts.slice(0, i).join("/"); if (base && (f + "/").length <= base.length) continue; folders.set(f, (folders.get(f) || 0) + n); } }
+      const css = [];
+      const hide = ["Scripts", "Templates"].map(x => (base || "") + x);
+      hide.forEach(x => css.push(`.nav-folder:has(> .nav-folder-title[data-path="${cssStr(x)}"]){display:none}`));
+      css.push(`.nav-file:has(> .nav-file-title[data-path="${cssStr((base || "") + "CLAUDE.md")}"]){display:none}`);
+      const badge = "margin-left:auto;padding-left:6px;font-size:.78em;color:var(--color-orange,#d98a1c);white-space:nowrap;";
+      for (const [p, n] of files) css.push(`.nav-file-title[data-path="${cssStr(p)}"]::after{content:"⏳${n}";${badge}}`);
+      for (const [p, n] of folders) css.push(`.nav-folder-title[data-path="${cssStr(p)}"]::after{content:"⏳${n}";${badge}}`);
+      let st = document.getElementById("zz-side");
+      if (!st) { st = h("style", { id: "zz-side" }); document.head.append(st); }
+      st.textContent = css.join("\n");
+    } catch (e) { console.warn("LIFE OS sidebar:", e); }
+  }
+  function root() {
+    if (!document.getElementById("zz-style-v3")) { const old = document.getElementById("zz-style"); if (old) old.remove(); document.head.append(h("style", { id: "zz-style-v3" }, CSS)); }
+    try { const B0 = (typeof input !== "undefined" && input && input.base) || ""; setTimeout(() => sidebar(B0), 50); } catch (e) { }
+    const r = h("div", { class: "zz" });
+    dv.container.append(r);
+    return r;
+  }
+  function bar(pc, color) {
+    const p = Math.max(0, Math.min(100, pc));
+    const c = color || (pc > 100 ? "var(--color-red,#d24343)" : pc > 85 ? "var(--color-orange,#d98a1c)" : "var(--interactive-accent)");
+    return h("div", { class: "zz-bar" }, h("div", { style: `width:${p}%;background:${c}` }));
+  }
+  const stat = (label, value, sub, cls) => h("div", { class: "zz-stat" }, h("div", { class: "zz-muted" }, label), h("div", { class: "zz-v " + (cls || "") }, value), sub ? h("div", { class: "zz-muted" }, sub) : null);
+  function flash(el, text, good = true) { el.textContent = text; el.className = "zz-msg " + (good ? "zz-ok" : "zz-bad"); }
+  // messages that survive a Dataview re-render for a few seconds
+  const MSGS = (window.__zzMsgs = window.__zzMsgs || {});
+  function msgEl(k) { const el = h("span", { class: "zz-msg" }); const m = MSGS[k]; if (m && Date.now() - m.t < 8000) flash(el, m.text, m.good); return el; }
+  function say(el, k, text, good = true) { MSGS[k] = { text, good, t: Date.now() }; flash(el, text, good); }
+  function confirmBtn(label, onConfirm, cls = "zz-x") {
+    let armed = false, timer;
+    const b = h("button", { class: cls, title: "Click twice to confirm" }, label);
+    b.addEventListener("click", async () => {
+      if (!armed) { armed = true; b.textContent = "sure?"; timer = setTimeout(() => { armed = false; b.textContent = label; }, 3000); return; }
+      clearTimeout(timer); b.disabled = true; await onConfirm();
+    });
+    return b;
+  }
+  function errorBox(e) { const r = root(); r.append(h("div", { class: "zz-card zz-bad" }, "⚠️ " + (e && e.message ? e.message : e))); }
+  function lineChart(points, opts = {}) {
+    // points: [{x: Date, y: number}], opts: {target, unit, height}
+    const W = 600, H = opts.height || 160, P = 28;
+    if (points.length < 2) return h("div", { class: "zz-muted" }, "Chart appears after 2+ entries.");
+    const xs = points.map(p => +p.x), ys = points.map(p => p.y);
+    if (isFinite(opts.target)) ys.push(opts.target);
+    let x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    if (x1 === x0) x1 = x0 + 1; if (y1 === y0) { y1 += 1; y0 -= 1; }
+    const pad = (y1 - y0) * 0.1; y0 -= pad; y1 += pad;
+    const X = x => P + (x - x0) / (x1 - x0) * (W - 2 * P), Y = y => H - P / 2 - (y - y0) / (y1 - y0) * (H - P);
+    const ns = "http://www.w3.org/2000/svg", s = (t, a) => { const e = document.createElementNS(ns, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", style: "max-height:220px" });
+    if (isFinite(opts.target)) svg.append(s("line", { x1: P, x2: W - P, y1: Y(opts.target), y2: Y(opts.target), stroke: "var(--color-green,#2e9e5b)", "stroke-dasharray": "5 4", "stroke-width": 1.5 }));
+    svg.append(s("polyline", { points: points.map(p => `${X(+p.x)},${Y(p.y)}`).join(" "), fill: "none", stroke: "var(--interactive-accent)", "stroke-width": 2.5 }));
+    points.forEach(p => svg.append(s("circle", { cx: X(+p.x), cy: Y(p.y), r: 3.5, fill: "var(--interactive-accent)" })));
+    const lab = (txt, x, y, anchor) => { const t = s("text", { x, y, "font-size": 12, fill: "var(--text-muted)", "text-anchor": anchor || "start" }); t.textContent = txt; return t; };
+    svg.append(lab(`${round2(Math.max(...points.map(p => p.y)))}${opts.unit || ""}`, 2, 12));
+    svg.append(lab(ymd(new Date(x0)), P, H - 2), lab(ymd(new Date(x1)), W - P, H - 2, "end"));
+    return svg;
+  }
+  function barChart(data, opts = {}) {
+    // data: [{label, v}], opts: {budget}
+    const W = 600, H = 190, P = 30, ns = "http://www.w3.org/2000/svg";
+    const s = (t, a) => { const e = document.createElementNS(ns, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
+    if (!data.length) return h("div", { class: "zz-muted" }, "No data yet.");
+    const max = Math.max(1, ...data.map(d => d.v), opts.budget || 0) * 1.1;
+    const bw = (W - 2 * P) / data.length;
+    const Y = v => H - P - v / max * (H - 2 * P);
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", style: "max-height:240px" });
+    data.forEach((d, i) => {
+      const x = P + i * bw + bw * 0.15, w = bw * 0.7, over = opts.budget > 0 && d.v > opts.budget;
+      svg.append(s("rect", { x, y: Y(d.v), width: w, height: Math.max(0, H - P - Y(d.v)), rx: 3, fill: over ? "var(--color-red,#d24343)" : "var(--interactive-accent)" }));
+      const t = s("text", { x: x + w / 2, y: Y(d.v) - 4, "font-size": 11, "text-anchor": "middle", fill: "var(--text-normal)" }); t.textContent = d.v ? Math.round(d.v) : ""; svg.append(t);
+      const lb = s("text", { x: x + w / 2, y: H - P + 14, "font-size": 11, "text-anchor": "middle", fill: "var(--text-muted)" }); lb.textContent = d.label; svg.append(lb);
+    });
+    if (opts.budget > 0) svg.append(s("line", { x1: P, x2: W - P, y1: Y(opts.budget), y2: Y(opts.budget), stroke: "var(--color-green,#2e9e5b)", "stroke-dasharray": "5 4", "stroke-width": 1.5 }));
+    return svg;
+  }
+  // donut: segments [{label, value, color}], centre text
+  function donut(segments, opts = {}) {
+    const S = opts.size || 180, R = S / 2 - 8, W = opts.width || 22, ns = "http://www.w3.org/2000/svg";
+    const s = (t, a) => { const e = document.createElementNS(ns, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
+    const svg = s("svg", { viewBox: `0 0 ${S} ${S}`, width: S, height: S, style: "flex:none" });
+    const total = segments.reduce((a, x) => a + Math.max(0, x.value), 0);
+    const C = 2 * Math.PI * R; let off = 0;
+    svg.append(s("circle", { cx: S / 2, cy: S / 2, r: R, fill: "none", stroke: "var(--background-modifier-border)", "stroke-width": W }));
+    if (total > 0) for (const x of segments) {
+      const v = Math.max(0, x.value); if (!v) continue;
+      const len = v / total * C;
+      svg.append(s("circle", { cx: S / 2, cy: S / 2, r: R, fill: "none", stroke: x.color, "stroke-width": W, "stroke-dasharray": `${len} ${C - len}`, "stroke-dashoffset": -off, transform: `rotate(-90 ${S / 2} ${S / 2})` }));
+      off += len;
+    }
+    const t1 = s("text", { x: S / 2, y: S / 2 - 2, "text-anchor": "middle", "font-size": opts.big || 22, "font-weight": 700, fill: "var(--text-normal)" }); t1.textContent = opts.center || "";
+    const t2 = s("text", { x: S / 2, y: S / 2 + 18, "text-anchor": "middle", "font-size": 12, fill: "var(--text-muted)" }); t2.textContent = opts.sub || "";
+    svg.append(t1, t2);
+    const legend = h("div", { class: "zz-legend" }, segments.filter(x => x.label).map(x => h("div", {}, h("span", { class: "zz-sw", style: `background:${x.color}` }), `${x.label}`, x.text ? h("span", { class: "zz-muted" }, " " + x.text) : null)));
+    return h("div", { class: "zz-donut" }, svg, legend);
+  }
+  const PALETTE = ["#4f8cff", "#2e9e5b", "#d98a1c", "#a259ff", "#e5484d", "#14b8a6", "#f472b6", "#84cc16", "#64748b", "#eab308", "#06b6d4", "#fb7185"];
+  // Austrian public holidays
+  function easter(y) { const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), hh = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - hh - k) % 7, m = Math.floor((a + 11 * hh + 22 * l) / 451), mo = Math.floor((hh + l - 7 * m + 114) / 31), da = ((hh + l - 7 * m + 114) % 31) + 1; return new Date(y, mo - 1, da); }
+  function holidaysAT(y) {
+    const E = easter(y), off = n => { const d = new Date(E); d.setDate(d.getDate() + n); return ymd(d); };
+    const f = (m, d) => `${y}-${pad(m)}-${pad(d)}`;
+    return { [f(1, 1)]: "Neujahr", [f(1, 6)]: "Heilige Drei Könige", [off(1)]: "Ostermontag", [f(5, 1)]: "Staatsfeiertag", [off(39)]: "Christi Himmelfahrt", [off(50)]: "Pfingstmontag", [off(60)]: "Fronleichnam", [f(8, 15)]: "Mariä Himmelfahrt", [f(10, 26)]: "Nationalfeiertag", [f(11, 1)]: "Allerheiligen", [f(12, 8)]: "Mariä Empfängnis", [f(12, 25)]: "Christtag", [f(12, 26)]: "Stefanitag" };
+  }
+
+  // ---------- everything with a date (calendar, home) ----------
+  const nextDay = s => { const d = toDate(s); d.setDate(d.getDate() + 1); return ymd(d); };
+  const timeStr = t => {
+    if (t === null || t === undefined || t === "") return "";
+    if (typeof t === "number") { const m = Math.round(t); return `${pad(Math.floor(m / 60))}:${pad(m % 60)}`; }
+    const m = /^(\d{1,2}):(\d{2})/.exec(String(t)); return m ? `${pad(+m[1])}:${m[2]}` : "";
+  };
+  // ---------- to-do lists inside notes ----------
+  const TODO_HEAD = /to-?\s?dos?\b|\btodo\b/i;
+  function parseTasks(text) {
+    const lines = String(text || "").split("\n"), out = [];
+    let inCode = false, head = "", inTodo = false;
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i];
+      if (/^\s*```/.test(ln)) { inCode = !inCode; continue; }
+      if (inCode) continue;
+      const hm = /^(#{1,6})\s+(.*)$/.exec(ln);
+      if (hm) { head = hm[2].trim(); inTodo = TODO_HEAD.test(head); continue; }
+      const m = /^\s*[-*+] \[(.)\] (.*)$/.exec(ln);
+      if (!m) continue;
+      const body = m[2];
+      const due = (/📅\s*(\d{4}-\d{2}-\d{2})/.exec(body) || [])[1] || "";
+      const doneDate = (/✅\s*(\d{4}-\d{2}-\d{2})/.exec(body) || [])[1] || "";
+      const tags = (body.match(/(^|\s)#[\w/-]+/g) || []).map(t => t.trim().slice(1).toLowerCase());
+      const clean = body.replace(/\[\[([^\]|]+)\|?([^\]]*)\]\]/g, (_, a, b) => b || a).replace(/(^|\s)#[\w/-]+/g, " ")
+        .replace(/(📅|✅|⏳|🛫|➕|⏫|🔼|🔽)️?\s*\d{4}-\d{2}-\d{2}/gu, " ").replace(/🔁\s*[^📅✅⏳🛫➕]*/gu, " ").replace(/\s+/g, " ").trim();
+      out.push({ line: i, raw: ln, done: m[1] !== " ", text: clean || body.trim(), due, doneDate, tags, section: head, inTodo });
+    }
+    return out;
+  }
+  async function toggleTask(path, line, raw, done) {
+    let ok = false;
+    await write(path, text => {
+      const lines = text.split("\n");
+      const i = lines[line] === raw ? line : lines.indexOf(raw);
+      if (i < 0) return text;
+      let t = lines[i];
+      if (done) { t = t.replace(/^(\s*[-*+] )\[ \]/, "$1[x]"); if (!/✅\s*\d{4}-\d{2}-\d{2}/.test(t)) t = t.replace(/\s+$/, "") + " ✅ " + today(); }
+      else t = t.replace(/^(\s*[-*+] )\[[^ ]\]/, "$1[ ]").replace(/\s*✅\s*\d{4}-\d{2}-\d{2}/, "");
+      lines[i] = t; ok = true;
+      return lines.join("\n");
+    });
+    return ok;
+  }
+  // moves an open to-do one place up (-1) or down (+1) among the open to-dos of the same list
+  async function moveTask(path, line, raw, dir) {
+    let ok = false;
+    await write(path, text => {
+      const lines = text.split("\n"), tasks = parseTasks(text);
+      const me = tasks.find(t => t.line === line && t.raw === raw) || tasks.find(t => t.raw === raw);
+      if (!me) return text;
+      const same = tasks.filter(t => !t.done && t.section === me.section);
+      const o = same[same.indexOf(me) + dir];
+      if (!o) return text;
+      [lines[me.line], lines[o.line]] = [lines[o.line], lines[me.line]]; ok = true;
+      return lines.join("\n");
+    });
+    return ok;
+  }
+  // adds or removes a #tag on one to-do line (used for 📌 "show on Home")
+  async function setTaskTag(path, line, raw, tag, on) {
+    let ok = false;
+    await write(path, text => {
+      const lines = text.split("\n"); const i = lines[line] === raw ? line : lines.indexOf(raw);
+      if (i < 0) return text;
+      const re = new RegExp("\\s#" + tag + "(?=\\s|$)", "g");
+      let t = lines[i].replace(re, "");
+      if (on) { const m = /\s(📅|✅)/u.exec(t); t = m ? t.slice(0, m.index) + " #" + tag + t.slice(m.index) : t.replace(/\s+$/, "") + " #" + tag; }
+      lines[i] = t; ok = true; return lines.join("\n");
+    });
+    return ok;
+  }
+  // adds "- [ ] text #tag 📅 due" to the end of the note's To-dos section (creates the section if missing)
+  async function addTask(path, text, due, tag) {
+    const task = "- [ ] " + String(text).replace(/[\r\n]+/g, " ").trim() + (tag ? " #" + String(tag).replace(/^#/, "") : "") + (due ? " 📅 " + due : "");
+    await write(path, t => {
+      const lines = t.split("\n");
+      let inCode = false, start = -1, lvl = 0;
+      for (let i = 0; i < lines.length; i++) {
+        if (/^\s*```/.test(lines[i])) { inCode = !inCode; continue; }
+        if (inCode) continue;
+        const hm = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+        if (hm && TODO_HEAD.test(hm[2])) { start = i; lvl = hm[1].length; break; }
+      }
+      if (start < 0) return t.replace(/\s+$/, "") + "\n\n## ✅ To-dos\n" + task + "\n";
+      let end = lines.length; inCode = false;
+      for (let i = start + 1; i < lines.length; i++) {
+        if (/^\s*```/.test(lines[i])) inCode = !inCode;
+        if (inCode) continue;
+        const hm = /^(#{1,6})\s/.exec(lines[i]);
+        if ((hm && hm[1].length <= lvl) || /^(---|\*\*\*)\s*$/.test(lines[i])) { end = i; break; }
+      }
+      let at = -1;
+      for (let i = start + 1; i < end; i++) if (/^\s*[-*+] \[.\] /.test(lines[i])) at = i + 1;
+      if (at < 0) { at = start + 1; while (at < end && lines[at].trim() !== "") at++; }
+      lines.splice(at, 0, task);
+      return lines.join("\n");
+    });
+    return task;
+  }
+  // make sure a table exists (adds it under a heading at the end of the note)
+  async function ensureTable(path, firstHeader, headers, heading) {
+    const t = await read(path);
+    if (t === null) throw new Error("Missing note: " + path);
+    if (findTable(t, firstHeader)) return false;
+    await write(path, text => findTable(text, firstHeader) ? text : setTable(text, firstHeader, headers, [], heading));
+    return true;
+  }
+
+  // ---------- Apple Calendar (through the Full Calendar Remastered plugin) ----------
+  const FC_IDS = ["full-calendar-remastered", "full-calendar"];
+  const FC_REMOTE = ["caldav", "ical", "google", "outlook"];
+  function fcPlugin() {
+    const P = APP.plugins && APP.plugins.plugins; if (!P) return null;
+    for (const id of FC_IDS) if (P[id] && P[id].api && typeof P[id].api.withToken === "function") return P[id];
+    return null;
+  }
+  function fcApi(B) {
+    const pl = fcPlugin(); if (!pl) return null;
+    const pg = dv.page(fix((B || "") + "Calendar"));
+    const tok = window.__zzFCtok || (pg && pg.fullcalendar_token ? String(pg.fullcalendar_token) : "");
+    if (!tok) return null;
+    const C = (window.__zzFC = window.__zzFC || {});
+    if (!(tok in C)) { try { C[tok] = pl.api.withToken(tok) || null; } catch (e) { C[tok] = null; } }
+    return C[tok];
+  }
+  // "none" = plugin not installed/enabled · "off" = installed, not allowed yet · "on" = connected
+  function fcState(B) { return !fcPlugin() ? "none" : fcApi(B) ? "on" : "off"; }
+  async function fcConnect(B) {
+    const pl = fcPlugin(); if (!pl) throw new Error("Install and enable Full Calendar Remastered first.");
+    const tok = await pl.api.requestAccess("zero-z-vault", "Show your Apple Calendar in the vault's Calendar page and on Home, and let the vault's ＋ Add event form save events to it.", ["events:read", "events:write", "providers:read"]);
+    if (!tok) return false;
+    window.__zzFCtok = tok;
+    await frontmatter(fix((B || "") + "Calendar.md"), fm => { fm.fullcalendar_token = tok; });
+    return true;
+  }
+  function fcCalendars(B) {
+    const api = fcApi(B); if (!api) return [];
+    try { return (api.getCalendarSources() || []).filter(c => FC_REMOTE.includes(c.type)).map(c => ({ id: c.id, name: c.name || c.type, type: c.type, color: c.color })); }
+    catch (e) { return []; }
+  }
+  async function fcCreate(B, calendarId, ev) {
+    const api = fcApi(B); if (!api) throw new Error("Apple Calendar isn't connected");
+    return await api.createEvent(calendarId, ev);
+  }
+  const isoDay = s => { const m = /(\d{4})-?(\d{2})-?(\d{2})/.exec(String(s || "")); return m ? `${m[1]}-${m[2]}-${m[3]}` : ""; };
+  const WDAY = { U: 0, M: 1, T: 2, W: 3, R: 4, F: 5, S: 6 }, BYDAY = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+  const nthOk = (d, n) => { const day = d.getDate(), last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(); return n > 0 ? Math.ceil(day / 7) === n : Math.ceil((last - day + 1) / 7) === -n; };
+  const monthsDiff = (a, b) => (b.getFullYear() - a.getFullYear()) * 12 + b.getMonth() - a.getMonth();
+  // dates (YYYY-MM-DD) on which an event happens between from and to
+  function occurrences(ev, from, to) {
+    const out = [], skip = new Set([].concat(ev.skipDates || []).map(isoDay));
+    const type = ev.type || "single";
+    if (type === "single") {
+      const s = isoDay(ev.date); if (!s) return out;
+      let e = isoDay(ev.endDate) || s; if (e < s) e = s;
+      let x = s, g = 0; while (x <= e && g++ < 400) { if (x >= from && x <= to) out.push(x); if (x > to) break; x = nextDay(x); }
+      return out;
+    }
+    let match, start, until = to, count = Infinity;
+    if (type === "recurring") {
+      start = isoDay(ev.startRecur) || from; if (ev.endRecur && isoDay(ev.endRecur) < until) until = isoDay(ev.endRecur);
+      const iv = Math.max(1, +ev.repeatInterval || 1), s0 = toDate(start), ws0 = weekStart(s0);
+      const dows = (ev.daysOfWeek || []).map(x => WDAY[x]).filter(x => x !== undefined);
+      match = d => {
+        if (ev.fcrDaily) return daysBetween(s0, d) % iv === 0;
+        if (dows.length) return dows.includes(d.getDay()) && Math.round((weekStart(d) - ws0) / 6048e5) % iv === 0;
+        if (ev.repeatOn) return d.getDay() === ev.repeatOn.weekday && nthOk(d, ev.repeatOn.week) && monthsDiff(s0, d) % iv === 0;
+        if (ev.dayOfMonth) return d.getDate() === +ev.dayOfMonth && (ev.month ? d.getMonth() + 1 === +ev.month : monthsDiff(s0, d) % iv === 0);
+        return false;
+      };
+    } else if (type === "rrule") {
+      start = isoDay(ev.startDate); if (!start) return out;
+      const line = (String(ev.rrule || "").split(/\n/).find(l => /FREQ=/i.test(l)) || "").replace(/^RRULE:/i, "");
+      const P = {}; line.split(";").forEach(kv => { const [k, v] = kv.split("="); if (k && v) P[k.toUpperCase()] = v; });
+      const freq = (P.FREQ || "").toUpperCase(), iv = Math.max(1, +P.INTERVAL || 1), s0 = toDate(start), ws0 = weekStart(s0);
+      if (P.UNTIL) { const u = isoDay(P.UNTIL); if (u && u < until) until = u; }
+      if (P.COUNT) count = +P.COUNT;
+      const byday = (P.BYDAY || "").split(",").filter(Boolean).map(x => { const m = /^([+-]?\d+)?([A-Z]{2})$/i.exec(x.trim()); return m ? { n: m[1] ? +m[1] : 0, wd: BYDAY[m[2].toUpperCase()] } : null; }).filter(Boolean);
+      const bymd = (P.BYMONTHDAY || "").split(",").filter(Boolean).map(Number), bymonth = (P.BYMONTH || "").split(",").filter(Boolean).map(Number);
+      const dayRule = d => {
+        if (bymd.length) { const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(); return bymd.some(n => n > 0 ? d.getDate() === n : d.getDate() === last + n + 1); }
+        if (byday.length) return byday.some(b => b.wd === d.getDay() && (!b.n || nthOk(d, b.n)));
+        return d.getDate() === s0.getDate();
+      };
+      match = d => {
+        if (bymonth.length && !bymonth.includes(d.getMonth() + 1)) return false;
+        if (freq === "DAILY") return daysBetween(s0, d) % iv === 0 && (!byday.length || byday.some(b => b.wd === d.getDay()));
+        if (freq === "WEEKLY") return Math.round((weekStart(d) - ws0) / 6048e5) % iv === 0 && (byday.length ? byday.some(b => b.wd === d.getDay()) : d.getDay() === s0.getDay());
+        if (freq === "MONTHLY") return monthsDiff(s0, d) % iv === 0 && dayRule(d);
+        if (freq === "YEARLY") return (d.getFullYear() - s0.getFullYear()) % iv === 0 && (bymonth.length || d.getMonth() === s0.getMonth()) && dayRule(d);
+        return false;
+      };
+    } else return out;
+    if (start > until) return out;
+    // walk day by day from the start (needed for COUNT), capped at ~20 years
+    let x = start, n = 0, g = 0;
+    while (x <= until && g++ < 7400) {
+      const d = toDate(x);
+      if (match(d)) { n++; if (n > count) break; if (x >= from && !skip.has(x)) out.push(x); }
+      x = nextDay(x);
+    }
+    return out;
+  }
+  function fcItems(B, from, to) {
+    const api = fcApi(B); if (!api) return [];
+    const cals = new Map(fcCalendars(B).map(c => [c.id, c]));
+    if (!cals.size) return [];
+    const items = [], moved = new Set();
+    const sources = (api.getAllEvents() || []).filter(src => cals.has(src.id));
+    for (const src of sources) for (const x of src.events || []) { const ev = x.event || {}; if (ev.recurrenceId && ev.uid) moved.add(ev.uid + "|" + isoDay(ev.recurrenceId)); }
+    for (const src of sources) {
+      const cal = cals.get(src.id);
+      for (const x of src.events || []) {
+        const ev = x.event || {};
+        if (ev.isTask || (ev.completed !== undefined && ev.completed !== null) || ev.display === "none") continue;
+        for (const d of occurrences(ev, from, to)) {
+          if ((ev.type === "rrule" || ev.type === "recurring") && ev.uid && moved.has(ev.uid + "|" + d)) continue;
+          items.push({ date: d, time: ev.allDay ? "" : timeStr(ev.startTime), icon: "🍎", text: (ev.title || "(no title)") + (ev.location ? " · " + ev.location : ""), link: null, kind: "apple", calendar: cal.name, color: src.color || cal.color });
+        }
+      }
+    }
+    return items;
+  }
+
+  async function collect(B, from, to, opts = {}) {
+    const items = [];
+    const add = (date, o) => { if (date && date >= from && date <= to) items.push({ date, time: "", ...o }); };
+    const yesv = s => /^(yes|y|ja|true|1|✅|x|on)$/i.test(String(s || "").trim());
+    // events
+    for (const p of dv.pages(`"${B}Calendar/Events"`)) {
+      const d = toDate(p.date); if (!d) continue;
+      const s = ymd(d), e = p.endDate && toDate(p.endDate) ? ymd(toDate(p.endDate)) : s;
+      let x = s, guard = 0;
+      while (x <= e && x <= to && guard++ < 366) { add(x, { time: p.allDay === true ? "" : timeStr(p.startTime), icon: "📌", text: p.title || p.file.name, link: p.file.path, kind: "event" }); x = nextDay(x); }
+    }
+    // tasks with 📅
+    if (!opts.noTasks) {
+      for (const f of APP.vault.getMarkdownFiles()) {
+        if (!f.path.startsWith(B) || /^(Templates|Scripts)\//.test(f.path.slice(B.length))) continue;
+        const t = await APP.vault.cachedRead(f);
+        if (!t.includes("📅")) continue;
+        for (const line of t.split("\n")) {
+          const m = /^\s*[-*+] \[([ \/])\] (.+?)\s*📅\s*(\d{4}-\d{2}-\d{2})/.exec(line);
+          if (!m) continue;
+          const text = m[2].replace(/\[\[([^\]|]+)\|?([^\]]*)\]\]/g, (_, a, b) => b || a).replace(/(^|\s)#[\w/-]+/g, "").replace(/[⏳🛫➕🔁⏫🔼🔽]\s*\S*/g, "").replace(/\s+/g, " ").trim();
+          add(m[3], { icon: "☑️", text, link: f.path, kind: "task" });
+        }
+      }
+    }
+    // uni: sessions table inside each course note + exam_date
+    for (const c of dv.pages("#course").where(p => p.file && p.file.path.startsWith(B))) {
+      if (c.status === "removed") continue;
+      const name = c.short || c.title || c.file.name;
+      const tb = tableObjects(await read(c.file.path), ["Date", "Start"]);
+      let examInTable = false;
+      if (tb) for (const r of tb.rows) {
+        if (!validYmd(r.date)) continue;
+        const exam = /exam|prüfung|klausur/i.test(r.type || "");
+        if (exam) examInTable = true;
+        add(r.date.trim(), { time: timeStr(r.start), icon: exam ? "📝" : "🎓", text: (exam ? "Exam: " : "") + name + (r.room ? ` · ${r.room}` : ""), link: c.file.path, kind: exam ? "exam" : "class", done: exam && c.status === "passed" });
+      }
+      if (!examInTable && c.exam_date && toDate(c.exam_date)) add(ymd(toDate(c.exam_date)), { icon: "📝", text: "Exam: " + name, link: c.file.path, kind: "exam", done: c.status === "passed" });
+    }
+    // content
+    for (const v of dv.pages(`"${B}Social Media/Content"`)) if (v.publish_date && toDate(v.publish_date)) add(ymd(toDate(v.publish_date)), { icon: v.stage === "published" ? "✅" : "🎬", text: v.title || v.file.name, link: v.file.path, kind: "content", done: v.stage === "published" });
+    // monthly payments
+    if (!opts.noPayments) {
+      const tb = tableObjects(await read(fix(B + "Money/Monthly Payments.md")), "Name");
+      if (tb) for (const r of tb.rows) {
+        if (!r.name || !yesv(r.active) || !/^\d{4}-\d{2}$/.test(r.start || "")) continue;
+        let mk = from.slice(0, 7), guard = 0;
+        while (mk <= to.slice(0, 7) && guard++ < 36) {
+          if (mk >= r.start) { const [y, m] = mk.split("-").map(Number); const last = new Date(y, m, 0).getDate(); add(`${mk}-${pad(Math.min(parseInt(r.day) || 1, last))}`, { icon: "🔁", text: `${r.name} ${eur(n0(r.amount))}`, link: fix(B + "Money/Monthly Payments.md"), kind: "payment" }); }
+          mk = addMonths(mk, 1);
+        }
+      }
+    }
+    // workouts, golf, Part-time Job shifts (what you did / planned)
+    const seen = new Set();
+    const wt = tableObjects(await read(fix(B + "Body/Workouts.md")), ["Date", "Session"]);
+    if (wt) for (const r of wt.rows) if (validYmd(r.date) && !seen.has(r.date + r.session)) { seen.add(r.date + r.session); add(r.date.trim(), { icon: "🏋️", text: r.session || "Workout", link: fix(B + "Body/Workouts.md"), kind: "workout", done: true }); }
+    const gt = tableObjects(await read(fix(B + "Body/Golf.md")), ["Date", "Course"]);
+    if (gt) for (const r of gt.rows) if (validYmd(r.date)) add(r.date.trim(), { icon: "⛳", text: `Golf ${r.score || ""}${r.course ? " · " + r.course : ""}`, link: fix(B + "Body/Golf.md"), kind: "golf", done: true });
+    const ft = tableObjects(await read(fix(B + "Business/Part-time Job.md")), ["Date", "Start"]);
+    if (ft) for (const r of ft.rows) if (validYmd(r.date)) add(r.date.trim(), { time: timeStr(r.start), icon: "🕹", text: `Part-time Job ${r.hours ? r.hours + " h" : ""}`, link: fix(B + "Business/Part-time Job.md"), kind: "shift" });
+    // Apple Calendar (Full Calendar Remastered, if connected)
+    if (!opts.noApple) { try { for (const it of fcItems(B, from, to)) if (it.date >= from && it.date <= to) items.push(it); } catch (e) { console.warn("LIFE OS Apple Calendar:", e); } }
+    // deadlines
+    const biz = dv.page(fix(B + "Business/Business")); if (biz && biz.decision_deadline && !biz.chosen_option) add(ymd(toDate(biz.decision_deadline)), { icon: "💼", text: "Business decision", link: fix(B + "Business/Business.md"), kind: "deadline" });
+    const golf = dv.page(fix(B + "Body/Golf")); if (golf && golf.deadline) add(ymd(toDate(golf.deadline)), { icon: "⛳", text: "Handicap < 10 deadline", link: fix(B + "Body/Golf.md"), kind: "deadline" });
+    for (let y = +from.slice(0, 4); y <= +to.slice(0, 4); y++) for (const [d, n] of Object.entries(holidaysAT(y))) add(d, { icon: "🇦🇹", text: n, kind: "holiday" });
+    const order = { holiday: 0, exam: 1, event: 2, apple: 2, class: 3, shift: 4, deadline: 5, content: 6, task: 7, payment: 8, workout: 9, golf: 10 };
+    return items.sort((a, b) => a.date.localeCompare(b.date) || (a.time || "99").localeCompare(b.time || "99") || order[a.kind] - order[b.kind]);
+  }
+  return { APP, pad, ymd, today, parseYmd, validYmd, toDate, daysBetween, daysUntil, monthKey, addMonths, monthName, weekStart, num, n0, round2, eur, eur0, fmt, plain, getFile, read, write, frontmatter, ensureFolder, createFile, safeName, link, tableObjects, readTable, setTable, writeTable, trash, openCount, computeOpen, sidebar, splitRow, findTable, makeRow, appendRow, deleteRow, h, root, bar, stat, flash, msgEl, say, confirmBtn, errorBox, lineChart, barChart, donut, PALETTE, collect, timeStr, easter, holidaysAT, parseTasks, toggleTask, moveTask, setTaskTag, addTask, ensureTable, fcPlugin, fcApi, fcState, fcConnect, fcCalendars, fcCreate, occurrences, isoDay, TODO_HEAD, fix };
+})();
+// ===== end shared helpers =====
+
+// ===== BUSINESS: dv.view(base+"Scripts/business", {base, mode}) =====
+// modes: options · inbox · ff-week · ff-history · ff-manage
+const { h } = zz;
+const B = (input && input.base) || "";
+const MODE = (input && input.mode) || "options";
+const HUB = zz.fix(B + "Business/Business.md");
+const RESEARCH = zz.fix(B + "Business/Research");
+const INBOX = zz.fix(B + "Business/Inbox");
+
+async function optionsView(r) {
+  const hub = dv.page(HUB) || {};
+  const opts = dv.pages(`"${RESEARCH}"`).where(p => p.option).array();
+  const card = h("div", { class: "zz-card" });
+  const n = zz.daysUntil(hub.decision_deadline);
+  card.append(h("h4", {}, hub.chosen_option ? `✅ Chosen: ${hub.chosen_option}` : `⏱ Decision in ${n === null ? "?" : n} days` + (hub.decision_deadline ? ` (${zz.ymd(zz.toDate(hub.decision_deadline))})` : "")));
+  const t = h("table", { class: "zz-table" }, h("tr", {}, ["Option", "Research", "Fit", "Fast money", "Real wealth", "1st customer in 30 d?", "Score"].map((x, i) => h("th", { class: i >= 2 ? "r" : "" }, x))));
+  const rows = [];
+  for (const p of opts) {
+    const text = (await zz.read(p.file.path)) || "";
+    const all = (text.match(/^\s*[-*] \[[ xX]\]/gm) || []).length, done = (text.match(/^\s*[-*] \[[xX]\]/gm) || []).length;
+    const sc = ["score_fit", "score_fast_money", "score_wealth", "score_first_customer"].map(k => zz.num(p[k]));
+    const filled = sc.filter(isFinite);
+    const total = filled.length === 4 ? sc.reduce((a, b) => a + b, 0) : null;
+    rows.push({ p, all, done, sc, total });
+  }
+  rows.sort((a, b) => (b.total ?? -1) - (a.total ?? -1));
+  const best = rows.length && rows[0].total !== null ? rows[0].total : null;
+  for (const x of rows) t.append(h("tr", {}, h("td", {}, zz.link(x.p.option, x.p.file.path)),
+    h("td", { style: "min-width:90px" }, zz.bar(x.all ? x.done / x.all * 100 : 0), h("span", { class: "zz-muted" }, `${x.done}/${x.all}`)),
+    x.sc.map(v => h("td", { class: "r" }, isFinite(v) ? v + "/10" : "⏳")),
+    h("td", { class: "r " + (x.total !== null && x.total === best ? "zz-ok" : "") }, x.total !== null ? h("strong", {}, x.total + "/40") : "⏳")));
+  card.append(opts.length ? t : h("div", { class: "zz-muted" }, "No research notes yet."),
+    h("div", { class: "zz-muted" }, "Scores live in each research note's properties (0–10). Research bar = ticked checklist items in that note."));
+  r.append(card);
+}
+
+async function inboxView(r) {
+  const files = zz.APP.vault.getFiles().filter(f => f.path.startsWith(INBOX + "/") && !/README\.md$/i.test(f.path) && !f.path.includes("/Done/"));
+  const card = h("div", { class: "zz-card" }, h("h4", {}, `📥 Inbox (${files.length})`));
+  if (!files.length) card.append(h("div", { class: "zz-muted" }, "Empty. Drop files into Business/Inbox (PDFs, screenshots, notes), then ask Claude to process the inbox."));
+  else {
+    const t = h("table", { class: "zz-table" }, h("tr", {}, ["File", "Type", "Added"].map(x => h("th", {}, x))));
+    files.sort((a, b) => (b.stat?.mtime || 0) - (a.stat?.mtime || 0)).forEach(f => t.append(h("tr", {}, h("td", {}, zz.link(f.name, f.path)), h("td", { class: "zz-muted" }, f.extension), h("td", { class: "zz-muted" }, f.stat?.mtime ? zz.ymd(new Date(f.stat.mtime)) : ""))));
+    card.append(t, h("div", { class: "zz-muted" }, "Ask Claude: \"Process my Business inbox\". It files everything and moves each file to Inbox/Done."));
+  }
+  r.append(card);
+}
+
+
+// ---------- FRIENDLY FIRE (weekly) ----------
+const FF = zz.fix(B + "Business/Part-time Job.md");
+const REC_T = "Weekly task", TODO_T = ["Week", "Task"], SHIFT_T = ["Date", "Start"], NOTES_T = "Week of";
+const keyf = s => String(s || "").trim().toLowerCase();
+const yesf = s => /^(yes|y|ja|true|1|✅|x|on)$/i.test(String(s || "").trim());
+const mondayOf = d => zz.ymd(zz.weekStart(zz.toDate(d)));
+const hoursBetween = (a, b) => { const m = x => { const r = /^(\d{1,2}):(\d{2})$/.exec(x || ""); return r ? +r[1] * 60 + +r[2] : null; }; const s = m(a), e = m(b); if (s === null || e === null) return null; let d = e - s; if (d < 0) d += 1440; return Math.round(d / 60 * 100) / 100; };
+async function ffData() {
+  const text = await zz.read(FF);
+  if (text === null) throw new Error("Missing note: " + FF);
+  const rec = zz.tableObjects(text, REC_T), todo = zz.tableObjects(text, TODO_T), sh = zz.tableObjects(text, SHIFT_T), nt = zz.tableObjects(text, NOTES_T);
+  return {
+    recurring: rec ? rec.rows.filter(r => r["weekly task"]).map(r => ({ name: r["weekly task"], active: yesf(r.active) })) : [],
+    todos: todo ? todo.rows.filter(r => zz.validYmd(r.week) && r.task).map(r => ({ line: r._line, raw: r._raw, week: r.week.trim(), task: r.task, done: yesf(r.done) })) : [],
+    shifts: sh ? sh.rows.filter(r => zz.validYmd(r.date)).map(r => ({ line: r._line, raw: r._raw, date: r.date.trim(), start: zz.timeStr(r.start), end: zz.timeStr(r.end), hours: zz.num(r.hours), note: r.note || "" })).sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)) : [],
+    checks: zz.parseTasks(text).filter(x => x.inTodo && !/weekly/i.test(x.section)).map(x => { const cw = mondayOf(zz.today()); return { ...x, week: x.done ? mondayOf(x.doneDate || x.due || zz.today()) : cw }; }),
+    notes: nt ? nt.rows.filter(r => zz.validYmd(r["week of"])).map(r => ({ line: r._line, raw: r._raw, week: r["week of"].trim(), text: String(r.notes || "").replace(/<br>/g, "\n") })) : [],
+  };
+}
+const fmtWeek = w => { const a = zz.toDate(w), e = new Date(a); e.setDate(e.getDate() + 6); return `${a.toLocaleDateString("en-GB", { day: "numeric", month: "short" })} – ${e.toLocaleDateString("en-GB", { day: "numeric", month: "short" })}`; };
+function weekTasks(d, week) {
+  const list = [];
+  for (const r of d.recurring.filter(x => x.active)) { const row = d.todos.find(t => t.week === week && keyf(t.task) === keyf(r.name)); list.push({ task: r.name, recurring: true, done: !!(row && row.done), row }); }
+  for (const t of d.todos.filter(t => t.week === week && !d.recurring.some(r => keyf(r.name) === keyf(t.task)))) list.push({ task: t.task, recurring: false, done: t.done, row: t });
+  for (const c of (d.checks || []).filter(c => c.week === week)) list.push({ task: c.text, recurring: false, done: c.done, check: c, due: c.due });
+  return list;
+}
+const SUM_T = "Summary week", SUM_H = ["Summary week", "Done", "Still open"];
+const splitDot = s => String(s || "").split(" · ").map(x => x.trim()).filter(Boolean);
+async function ffSummarySync(d) {
+  const cur = mondayOf(zz.today());
+  const weeks = [...new Set([cur, ...d.checks.filter(c => c.done).map(c => c.week), ...d.todos.filter(x => x.done).map(x => x.week)])].filter(w => w <= cur);
+  const calc = text => {
+    const tb = zz.tableObjects(text, SUM_T);
+    const old = new Map(tb ? tb.rows.filter(x => zz.validYmd(x["summary week"])).map(x => [x["summary week"].trim(), { done: splitDot(x.done), open: x["still open"] || "" }]) : []);
+    for (const w of weeks) {
+      const tasks = weekTasks(d, w), done = tasks.filter(x => x.done).map(x => x.task.replace(/\|/g, "/"));
+      const o = old.get(w) || { done: [], open: "" };
+      const merged = w === cur ? done : [...new Set([...o.done, ...done])];
+      old.set(w, { done: merged, open: w === cur ? tasks.filter(x => !x.done).map(x => x.task.replace(/\|/g, "/")).join(" · ") : o.open });
+    }
+    const rows = [...old.entries()].filter(([w, v]) => v.done.length || v.open || w === cur).sort((a, b) => b[0].localeCompare(a[0])).map(([w, v]) => [w, v.done.join(" · "), v.open]);
+    const next = zz.setTable(text, SUM_T, SUM_H, rows, "## 📒 Weekly summary\n*Saved automatically: what I ticked off each week (Summary week = the Monday).*\n");
+    return next;
+  };
+  const t0 = await zz.read(FF);
+  if (t0 !== null && calc(t0) !== t0) await zz.write(FF, calc);
+}
+async function ffWeek(r, week) {
+  await ffSummarySync(await ffData());
+  const d = await ffData();
+  const MK = "ff:" + B, msg = zz.msgEl(MK);
+  const cur = mondayOf(zz.today());
+  const tasks = weekTasks(d, week), done = tasks.filter(t => t.done).length;
+  const ws = d.shifts.filter(s => mondayOf(s.date) === week), hrs = ws.reduce((s, x) => s + (isFinite(x.hours) ? x.hours : 0), 0);
+  const card = h("div", { class: "zz-card" });
+  card.append(h("div", { class: "zz-row" },
+    h("button", { class: "zz-btn", onclick: () => rerender(zz.ymd(new Date(zz.toDate(week).getTime() - 7 * 864e5))) }, "←"),
+    h("strong", { style: "min-width:170px;text-align:center" }, (week === cur ? "This week · " : "") + fmtWeek(week)),
+    h("button", { class: "zz-btn", onclick: () => rerender(zz.ymd(new Date(zz.toDate(week).getTime() + 7 * 864e5))) }, "→"),
+    week !== cur ? h("button", { class: "zz-btn", onclick: () => rerender(cur) }, "This week") : null));
+  card.append(h("div", { class: "zz-tiles" },
+    h("div", { class: "zz-tile" }, h("div", { class: "zz-muted" }, "To-dos"), h("div", { class: "zz-v " + (tasks.length && done === tasks.length ? "zz-ok" : "") }, `${done} / ${tasks.length}`), zz.bar(tasks.length ? done / tasks.length * 100 : 0, tasks.length && done === tasks.length ? "var(--color-green,#2e9e5b)" : undefined)),
+    ws.length ? h("div", { class: "zz-tile" }, h("div", { class: "zz-muted" }, "Jumped in"), h("div", { class: "zz-v" }, `${ws.length}× · ${zz.round2(hrs)} h`), h("div", { class: "zz-muted" }, ws.map(s => zz.toDate(s.date).toLocaleDateString("en-GB", { weekday: "short" })).join(" · "))) : null));
+  // to-dos
+  const tl = h("div", {});
+  for (const t of tasks) {
+    const cb = h("input", { type: "checkbox", checked: t.done });
+    cb.addEventListener("change", async () => {
+      cb.disabled = true;
+      if (t.check) await zz.toggleTask(FF, t.check.line, t.check.raw, cb.checked);
+      else if (t.row) await zz.write(FF, text => { const tb = zz.tableObjects(text, TODO_T); if (!tb) return text; const row = tb.t.rows.find(x => x.line === t.row.line && x.raw === t.row.raw) || tb.t.rows.find(x => x.raw === t.row.raw); if (!row) return text; const i = tb.keys.indexOf("done"); row.cells[i] = cb.checked ? "yes" : "no"; tb.t.lines[row.line] = zz.makeRow(row.cells); return tb.t.lines.join("\n"); });
+      else await zz.appendRow(FF, TODO_T, [week, t.task, cb.checked ? "yes" : "no"]);
+      await rerender(week);
+    });
+    const del = !t.recurring ? zz.confirmBtn("✕", async () => { const x = t.check || t.row; await zz.deleteRow(FF, x.line, x.raw); await rerender(week); }) : null;
+    tl.append(h("div", { class: "zz-row", style: "margin:2px 0" }, h("label", { style: t.done ? "text-decoration:line-through;opacity:.6" : "" }, cb, " ", t.task), t.recurring ? h("span", { class: "zz-chip" }, "🔁 weekly") : null, t.due && !t.done ? h("span", { class: "zz-chip" }, "📅 " + zz.toDate(t.due).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })) : null, del));
+  }
+  if (!tasks.length) tl.append(h("div", { class: "zz-muted" }, "No to-dos for this week yet."));
+  const newT = h("input", { type: "text", placeholder: "New task…", style: "width:260px" });
+  const addT = async () => { const v = newT.value.trim(); if (!v) return; if (/\|/.test(v)) return zz.flash(msg, "No | please", false); await zz.addTask(FF, v, "", "ff"); zz.say(msg, MK, "✅ Added"); await rerender(week); };
+  newT.addEventListener("keydown", e => { if (e.key === "Enter") addT(); });
+  // shifts
+  const sd = h("input", { type: "date", value: week === cur ? zz.today() : week }), s1 = h("input", { type: "time", value: "16:00" }), s2 = h("input", { type: "time", value: "20:00" }), sn = h("input", { type: "text", placeholder: "Note", style: "width:140px" });
+  const addS = async () => {
+    if (!zz.validYmd(sd.value)) return zz.flash(msg, "Pick a date", false);
+    const hrsv = hoursBetween(s1.value, s2.value); if (!hrsv) return zz.flash(msg, "Check start and end time", false);
+    await zz.appendRow(FF, SHIFT_T, [sd.value, s1.value, s2.value, hrsv, sn.value]); zz.say(msg, MK, `✅ Logged: ${hrsv} h`); await rerender(mondayOf(sd.value));
+  };
+  const st = h("div", {}, ws.map(s => h("div", { class: "zz-row", style: "margin:2px 0" }, `🕹 ${zz.toDate(s.date).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })} ${s.start}–${s.end} · ${s.hours} h`, s.note ? h("span", { class: "zz-muted" }, s.note) : null, zz.confirmBtn("✕", async () => { await zz.deleteRow(FF, s.line, s.raw); await rerender(week); }))));
+  // notes
+  const note = d.notes.find(n => n.week === week);
+  const ta = h("textarea", { rows: 4, style: "width:100%", placeholder: "Paste the boss's weekly message, handover, problems, ideas…" }); ta.value = note ? note.text : "";
+  const saveN = async () => {
+    const v = ta.value.trim().replace(/\|/g, "/").replace(/\r?\n/g, "<br>");
+    await zz.write(FF, text => {
+      const tb = zz.tableObjects(text, NOTES_T);
+      const rows = tb ? tb.rows.filter(x => zz.validYmd(x["week of"])).map(x => [x["week of"].trim(), x.notes || ""]) : [];
+      const i = rows.findIndex(x => x[0] === week);
+      if (i >= 0) { if (v) rows[i][1] = v; else rows.splice(i, 1); } else if (v) rows.push([week, v]);
+      rows.sort((a, b) => a[0].localeCompare(b[0]));
+      return zz.setTable(text, NOTES_T, ["Week of", "Notes"], rows, "## 📝 Weekly notes");
+    });
+    zz.say(msg, MK, "✅ Notes saved");
+  };
+  card.append(h("h4", {}, "✅ To-dos this week"), tl, h("div", { class: "zz-row" }, newT, h("button", { class: "zz-btn", onclick: addT }, "＋")),
+    h("details", { style: "margin-top:8px" }, h("summary", { class: "zz-muted" }, `🕹 Jumped in to work${ws.length ? ` (${ws.length})` : ""}`), st, h("div", { class: "zz-row" }, sd, s1, "–", s2, sn, h("button", { class: "zz-btn", onclick: addS }, "＋ Log")), h("div", { class: "zz-muted" }, "Only when I have to jump in for a shift.")),
+    h("h4", {}, "📩 Message / notes this week"), ta, h("div", { class: "zz-row" }, h("button", { class: "zz-btn mod-cta", onclick: saveN }, "💾 Save notes"), msg));
+  r.append(card);
+}
+async function ffHistory(r) {
+  const d0 = await ffData(); await ffSummarySync(d0);
+  const text = await zz.read(FF), tb = zz.tableObjects(text, SUM_T), d = await ffData();
+  const rows = tb ? tb.rows.filter(x => zz.validYmd(x["summary week"])).map(x => ({ week: x["summary week"].trim(), done: splitDot(x.done), open: splitDot(x["still open"]) })).sort((a, b) => b.week.localeCompare(a.week)) : [];
+  const card = h("div", { class: "zz-card" }, h("h4", {}, `📚 Weekly summary (${rows.length} weeks)`));
+  if (!rows.length) { card.append(h("div", { class: "zz-muted" }, "Builds up week by week as you tick to-dos.")); return r.append(card); }
+  const cur = mondayOf(zz.today());
+  for (const w of rows) {
+    const ws = d.shifts.filter(s => mondayOf(s.date) === w.week), hrs = ws.reduce((s, x) => s + (isFinite(x.hours) ? x.hours : 0), 0), n = d.notes.find(x => x.week === w.week);
+    card.append(h("details", { open: w.week === cur, style: "margin:4px 0" },
+      h("summary", {}, h("strong", {}, (w.week === cur ? "This week · " : "") + fmtWeek(w.week)), " ", h("span", { class: "zz-chip" }, `✅ ${w.done.length}`), w.open.length ? h("span", { class: "zz-chip" }, `open ${w.open.length}`) : null, ws.length ? h("span", { class: "zz-chip" }, `🕹 ${zz.round2(hrs)} h`) : null),
+      w.done.length ? w.done.map(x => h("div", { style: "margin-left:14px" }, "✅ " + x)) : h("div", { class: "zz-muted", style: "margin-left:14px" }, "Nothing ticked off."),
+      w.open.length ? h("div", { class: "zz-muted", style: "margin-left:14px" }, (w.week === cur ? "Still open: " : "Was still open: ") + w.open.join(", ")) : null,
+      n ? h("div", { class: "zz-muted", style: "margin-left:14px;white-space:pre-wrap" }, "📝 " + n.text) : null));
+  }
+  card.append(h("div", { class: "zz-muted" }, "Saved as a table in this note (📒 Weekly summary), so it stays even if you delete old to-dos."));
+  r.append(card);
+}
+async function ffManage(r) {
+  const d = await ffData();
+  const rows = d.recurring.map(x => ({ ...x, deleted: false }));
+  const MK = "ffm:" + B, msg = zz.msgEl(MK), box = h("div", {});
+  const draw = () => { box.innerHTML = ""; rows.forEach(x => { if (x.deleted) return; const a = h("input", { type: "checkbox", checked: x.active }), n = h("input", { type: "text", value: x.name, style: "width:260px", placeholder: "e.g. Plan next week's shifts" }); a.onchange = () => x.active = a.checked; n.oninput = () => x.name = n.value; box.append(h("div", { class: "zz-row" }, a, n, zz.confirmBtn("✕", () => { x.deleted = true; draw(); }))); }); };
+  draw();
+  const save = async () => {
+    const live = rows.filter(x => !x.deleted), seen = new Set();
+    for (const x of live) { const n = String(x.name || "").trim(); if (!n) return zz.flash(msg, "Empty task name", false); if (/\|/.test(n)) return zz.flash(msg, "No | please", false); if (seen.has(keyf(n))) return zz.flash(msg, "Duplicate: " + n, false); seen.add(keyf(n)); }
+    await zz.writeTable(FF, REC_T, ["Weekly task", "Active"], live.map(x => [String(x.name).trim(), x.active ? "yes" : "no"]), "## 🔁 Weekly to-dos");
+    zz.say(msg, MK, "✅ Saved"); await rerender();
+  };
+  r.append(h("details", { class: "zz-card" }, h("summary", {}, "⚙️ Tasks that repeat every week"), box,
+    h("div", { class: "zz-row" }, h("button", { class: "zz-btn", onclick: () => { rows.push({ name: "", active: true, deleted: false }); draw(); } }, "＋ Weekly task"), h("button", { class: "zz-btn mod-cta", onclick: save }, "💾 Save"), msg),
+    h("div", { class: "zz-muted" }, "These show up every week. Normal tasks (＋ above) stay open until you tick them.")));
+}
+
+const R = zz.root();
+let WEEK = null;
+async function rerender(w) { if (w) WEEK = w; R.innerHTML = ""; await run(); }
+async function run() {
+  try {
+    if (MODE === "options") await optionsView(R);
+    else if (MODE === "inbox") await inboxView(R);
+    else if (MODE === "ff-week") await ffWeek(R, WEEK || mondayOf(zz.today()));
+    else if (MODE === "ff-history") await ffHistory(R);
+    else if (MODE === "ff-manage") await ffManage(R);
+    else R.append(h("div", { class: "zz-bad" }, "Unknown mode: " + MODE));
+  } catch (e) { R.append(h("div", { class: "zz-card zz-bad" }, "⚠️ " + e.message)); }
+}
+await run();
